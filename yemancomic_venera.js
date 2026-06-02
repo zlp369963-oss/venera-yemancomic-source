@@ -2,7 +2,7 @@
 class YemanComicSource extends ComicSource {
     name = "野蛮漫画"
     key = "yemancomic"
-    version = "0.1.0"
+    version = "0.1.1"
     minAppVersion = "1.6.0"
     url = ""
 
@@ -31,6 +31,89 @@ class YemanComicSource extends ComicSource {
         let res = await Network.get(url, this.headers)
         if (res.status !== 200) throw `Request Error: ${res.status} ${url}`
         return new HtmlDocument(res.body)
+    }
+
+    async getText(url) {
+        let res = await Network.get(url, this.headers)
+        if (res.status !== 200) throw `Request Error: ${res.status} ${url}`
+        return res.body || ""
+    }
+
+    parseReadMeta(html, fallbackUrl) {
+        let aid = ""
+        let cid = ""
+        let picCount = 0
+        let m = html.match(/read\s*=\s*\{([\s\S]*?)\}<\/script>/i)
+        let block = m ? m[1] : html
+        let aidMatch = block.match(/aid\s*:\s*['"]?(\d+)['"]?/i)
+        let cidMatch = block.match(/(?:apiCid|cid)\s*:\s*['"]?(\d+)['"]?/i)
+        let countMatch = block.match(/picCount\s*:\s*['"]?(\d+)['"]?/i)
+        if (aidMatch) aid = aidMatch[1]
+        if (cidMatch) cid = cidMatch[1]
+        if (countMatch) picCount = parseInt(countMatch[1])
+        if ((!aid || !cid) && fallbackUrl) {
+            let urlMatch = ("" + fallbackUrl).match(/\/chapter\/(\d+)\/(\d+)\.html/i)
+            if (urlMatch) {
+                aid = aid || urlMatch[1]
+                cid = cid || urlMatch[2]
+            }
+        }
+        return { aid, cid, picCount }
+    }
+
+    parsePicApiResponse(body) {
+        let images = []
+        let total = 0
+        try {
+            let json = JSON.parse(body)
+            if (json && json.data) {
+                total = parseInt(json.data.total || 0)
+                let pics = json.data.pic || []
+                for (let item of pics) {
+                    let pic = item && item.pic ? this.abs(item.pic.replace(/\\\//g, "/")) : ""
+                    if (pic) images.push(pic)
+                }
+            }
+        } catch (e) {
+            let matches = body.match(/"pic"\s*:\s*"([^"]+)"/g) || []
+            for (let item of matches) {
+                let m = item.match(/"pic"\s*:\s*"([^"]+)"/)
+                if (m) images.push(this.abs(m[1].replace(/\\\//g, "/")))
+            }
+            let totalMatch = body.match(/"total"\s*:\s*(\d+)/)
+            if (totalMatch) total = parseInt(totalMatch[1])
+        }
+        return { images, total }
+    }
+
+    async loadPicsFromApi(aid, cid, referer, picCount) {
+        let images = []
+        let seen = {}
+        let offset = 0
+        let limit = 20
+        let total = picCount || 0
+        while (offset < 300) {
+            let body = `id=${encodeURIComponent(cid)}&aid=${encodeURIComponent(aid)}&offset=${offset}&limit=${limit}`
+            let headers = Object.assign({}, this.headers, {
+                "Referer": referer,
+                "Content-Type": "application/x-www-form-urlencoded"
+            })
+            let res = await Network.post(`${this.baseUrl}/api/comic/read/pics`, headers, Convert.encodeUtf8(body))
+            if (res.status !== 200) break
+            let parsed = this.parsePicApiResponse(res.body || "")
+            if (parsed.total) total = parsed.total
+            if (!parsed.images.length) break
+            for (let img of parsed.images) {
+                if (!seen[img]) {
+                    seen[img] = true
+                    images.push(img)
+                }
+            }
+            offset += parsed.images.length
+            if (total && images.length >= total) break
+            if (parsed.images.length < limit) break
+        }
+        return images
     }
 
     parseComicItem(item) {
@@ -225,7 +308,19 @@ class YemanComicSource extends ComicSource {
             let images = []
             let seen = {}
             for (let i = 0; i < 80 && url; i++) {
-                let doc = await this.getDoc(url)
+                let html = await this.getText(url)
+                let meta = this.parseReadMeta(html, url)
+                if (meta.aid && meta.cid) {
+                    let apiImages = await this.loadPicsFromApi(meta.aid, meta.cid, url, meta.picCount)
+                    for (let img of apiImages) {
+                        if (!seen[img]) {
+                            seen[img] = true
+                            images.push(img)
+                        }
+                    }
+                    if (images.length) break
+                }
+                let doc = new HtmlDocument(html)
                 let imgNodes = doc.querySelectorAll(".rd-article img, .comicpage img, .comic-page img, .chapter-content img, .read-content img, #images img, article img, img")
                 for (let img of imgNodes) {
                     let src = this.attr(img, "data-original") || this.attr(img, "data-src") || this.attr(img, "src")
